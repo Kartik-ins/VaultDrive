@@ -44,7 +44,9 @@ export class CacheService {
    */
   async set(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
     try {
-      const serialized = JSON.stringify(value);
+      const serialized = JSON.stringify(value, (_, v) =>
+        typeof v === 'bigint' ? v.toString() : v
+      );
       if (ttlSeconds !== undefined && ttlSeconds > 0) {
         await redis.set(key, serialized, 'EX', ttlSeconds);
       } else {

@@ -15,8 +15,8 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { serverConfig } from './index';
 
 export const s3Client = new S3Client({
-  endpoint: 'https://s3.filebase.com',
-  region: 'us-east-1',
+  endpoint: 'https://s3.filebase.io',
+  region: 'auto',
   credentials: {
     accessKeyId: serverConfig.FILEBASE_ACCESS_KEY,
     secretAccessKey: serverConfig.FILEBASE_SECRET_KEY,
