@@ -1,0 +1,173 @@
+// ──────────────────────────────────────────────────────────────────────────────
+// VaultDrive — Prisma Schema
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Design decisions:
+//
+// 1. Content-addressable storage: Chunks are identified by SHA-256 hash.
+//    Two users uploading identical content will share the same physical chunk
+//    in object storage, while maintaining independent file metadata.
+//
+// 2. Reference counting: Each Chunk tracks how many FileVersions reference it.
+//    This enables safe garbage collection — a chunk's object is only deleted
+//    from storage when referenceCount drops to zero.
+//
+// 3. Immutable versioning: Every file mutation creates a new FileVersion.
+//    Restoring a previous version creates a *new* version pointing to the
+//    same chunks — no data is copied, just metadata.
+//
+// 4. Ordered chunk assembly: FileChunk is a join table with a chunkIndex field
+//    that preserves the order in which chunks must be concatenated to
+//    reconstruct the original file.
+//
+// 5. Upload sessions: Tracked in both PostgreSQL (durability) and Redis (speed).
+//    The uploadedChunks JSON array stores which indices are done, enabling
+//    the client to resume from exactly where it left off.
+// ──────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Users ───────────────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String   // bcrypt hash — never stored in plaintext
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  files          File[]
+  uploadSessions UploadSession[]
+
+  @@map("users")
+}
+
+// ─── Files ───────────────────────────────────────────────────────────────────
+
+model File {
+  id               String   @id @default(uuid())
+  filename         String   // original user-facing filename
+  mimeType         String
+  totalSize        BigInt   // total size in bytes
+  ownerId          String
+  currentVersionId String?  @unique // points to the latest version
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  owner      User          @relation(fields: [ownerId], references: [id])
+  versions   FileVersion[]
+  shareLinks ShareLink[]
+
+  @@index([ownerId])
+  @@map("files")
+}
+
+// ─── File Versions ───────────────────────────────────────────────────────────
+// Every upload or update creates a new version. Previous versions are preserved
+// indefinitely. Restoring a version creates a new version that references the
+// same chunks — zero-copy restore.
+
+model FileVersion {
+  id         String   @id @default(uuid())
+  fileId     String
+  versionNum Int      // monotonically increasing per file
+  totalSize  BigInt
+  sha256Hash String   // hash of the entire assembled file content
+  createdAt  DateTime @default(now())
+
+  file   File        @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  chunks FileChunk[] // ordered join table
+
+  @@unique([fileId, versionNum])
+  @@index([fileId])
+  @@map("file_versions")
+}
+
+// ─── Chunks ──────────────────────────────────────────────────────────────────
+// The core deduplication unit. Content-addressable by SHA-256 hash.
+// Multiple FileVersions (even across different users) can reference the
+// same chunk. referenceCount enables safe garbage collection.
+
+model Chunk {
+  id             String   @id @default(uuid())
+  sha256Hash     String   @unique // content-addressable key
+  storageKey     String   @unique // object key in Filebase/S3
+  size           BigInt   // chunk size in bytes
+  referenceCount Int      @default(1)
+  createdAt      DateTime @default(now())
+
+  fileChunks FileChunk[]
+
+  @@map("chunks")
+}
+
+// ─── FileChunk (Join Table) ──────────────────────────────────────────────────
+// Maps a FileVersion to its constituent Chunks in order.
+// chunkIndex preserves the assembly order for file reconstruction.
+
+model FileChunk {
+  id            String @id @default(uuid())
+  fileVersionId String
+  chunkId       String
+  chunkIndex    Int    // 0-based ordering position
+
+  fileVersion FileVersion @relation(fields: [fileVersionId], references: [id], onDelete: Cascade)
+  chunk       Chunk       @relation(fields: [chunkId], references: [id])
+
+  @@unique([fileVersionId, chunkIndex])
+  @@index([fileVersionId])
+  @@index([chunkId])
+  @@map("file_chunks")
+}
+
+// ─── Upload Sessions ─────────────────────────────────────────────────────────
+// Tracks multi-chunk upload lifecycle. Chunks can arrive in any order.
+// The uploadedChunks JSON array stores completed indices so the client
+// can query which chunks still need to be sent (resumable upload).
+
+model UploadSession {
+  id             String   @id @default(uuid())
+  userId         String
+  filename       String
+  mimeType       String
+  totalSize      BigInt   // expected total file size
+  totalChunks    Int      // expected number of chunks
+  chunkSize      Int      // bytes per chunk (last chunk may be smaller)
+  uploadedChunks Json     @default("[]") // int[] of completed chunk indices
+  status         String   @default("pending") // pending | completed | expired
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("upload_sessions")
+}
+
+// ─── Share Links ─────────────────────────────────────────────────────────────
+// Secure file sharing via random tokens. Supports optional expiration
+// dates and download limits.
+
+model ShareLink {
+  id            String    @id @default(uuid())
+  fileId        String
+  token         String    @unique // cryptographically random token
+  expiresAt     DateTime? // null = never expires
+  maxDownloads  Int?      // null = unlimited
+  downloadCount Int       @default(0)
+  createdAt     DateTime  @default(now())
+
+  file File @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([fileId])
+  @@map("share_links")
+}
