@@ -97,19 +97,40 @@ export class FileService {
     }
 
     // 4. Create all database records atomically
-    const file = await fileRepository.createFileWithVersion({
-      filename,
-      mimeType,
-      totalSize,
-      ownerId,
-      sha256Hash: fileHash,
-      chunks: chunks.map((c) => ({
-        sha256Hash: c.sha256Hash,
-        storageKey: c.storageKey,
-        size: c.size,
-        chunkIndex: c.chunkIndex,
-      })),
-    });
+    const existingFile = await fileRepository.findFileByNameAndOwner(filename, ownerId);
+    let file;
+
+    if (existingFile) {
+      logger.info('FileService: file already exists, adding new version', {
+        filename,
+        fileId: existingFile.id,
+      });
+      file = await fileRepository.addVersionToFile(existingFile.id, {
+        totalSize,
+        sha256Hash: fileHash,
+        chunks: chunks.map((c) => ({
+          sha256Hash: c.sha256Hash,
+          storageKey: c.storageKey,
+          size: c.size,
+          chunkIndex: c.chunkIndex,
+        })),
+      });
+    } else {
+      logger.info('FileService: creating new file', { filename });
+      file = await fileRepository.createFileWithVersion({
+        filename,
+        mimeType,
+        totalSize,
+        ownerId,
+        sha256Hash: fileHash,
+        chunks: chunks.map((c) => ({
+          sha256Hash: c.sha256Hash,
+          storageKey: c.storageKey,
+          size: c.size,
+          chunkIndex: c.chunkIndex,
+        })),
+      });
+    }
 
     logger.info('FileService: upload complete', { fileId: file.id });
     const serialized = this.serializeFile(file);

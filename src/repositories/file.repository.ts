@@ -258,6 +258,135 @@ export class FileRepository {
       orderBy: { chunkIndex: 'asc' },
     });
   }
+
+  /**
+   * Find a file by its original filename and owner ID.
+   * Used to check if an upload should create a new version of an existing file.
+   */
+  async findFileByNameAndOwner(filename: string, ownerId: string) {
+    return prisma.file.findFirst({
+      where: { filename, ownerId },
+    });
+  }
+
+  /**
+   * Add a new version to an existing file in an atomic transaction.
+   * Monotonically increments the version number.
+   */
+  async addVersionToFile(fileId: string, data: {
+    totalSize: bigint;
+    sha256Hash: string;
+    chunks: { sha256Hash: string; storageKey: string; size: bigint; chunkIndex: number }[];
+  }) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return prisma.$transaction(async (tx: any) => {
+      // 1. Find the current latest version number
+      const latestVersion = await tx.fileVersion.findFirst({
+        where: { fileId },
+        orderBy: { versionNum: 'desc' },
+      });
+      const nextVersionNum = latestVersion ? latestVersion.versionNum + 1 : 1;
+
+      // 2. Create the new file version record
+      const version = await tx.fileVersion.create({
+        data: {
+          fileId,
+          versionNum: nextVersionNum,
+          totalSize: data.totalSize,
+          sha256Hash: data.sha256Hash,
+        },
+      });
+
+      // 3. Create or reference chunks (incrementing referenceCount for duplicates)
+      for (const chunkData of data.chunks) {
+        let chunk = await tx.chunk.findUnique({
+          where: { sha256Hash: chunkData.sha256Hash },
+        });
+
+        if (chunk) {
+          chunk = await tx.chunk.update({
+            where: { id: chunk.id },
+            data: { referenceCount: { increment: 1 } },
+          });
+          logger.info('Dedup: reusing existing chunk for new version', {
+            hash: chunkData.sha256Hash,
+            newRefCount: chunk.referenceCount,
+          });
+        } else {
+          chunk = await tx.chunk.create({
+            data: {
+              sha256Hash: chunkData.sha256Hash,
+              storageKey: chunkData.storageKey,
+              size: chunkData.size,
+              referenceCount: 1,
+            },
+          });
+        }
+
+        // 4. Link version to chunk
+        await tx.fileChunk.create({
+          data: {
+            fileVersionId: version.id,
+            chunkId: chunk.id,
+            chunkIndex: chunkData.chunkIndex,
+          },
+        });
+      }
+
+      // 5. Update the parent file's currentVersionId and size metadata
+      const updatedFile = await tx.file.update({
+        where: { id: fileId },
+        data: {
+          currentVersionId: version.id,
+          totalSize: data.totalSize,
+        },
+        include: {
+          versions: {
+            include: {
+              chunks: {
+                include: { chunk: true },
+                orderBy: { chunkIndex: 'asc' },
+              },
+            },
+            orderBy: { versionNum: 'desc' },
+          },
+        },
+      });
+
+      return updatedFile;
+    });
+  }
+
+  /**
+   * Retrieve all versions of a file, sorted from newest to oldest.
+   */
+  async findVersionsByFileId(fileId: string) {
+    return prisma.fileVersion.findMany({
+      where: { fileId },
+      orderBy: { versionNum: 'desc' },
+      include: {
+        chunks: {
+          include: { chunk: true },
+          orderBy: { chunkIndex: 'asc' },
+        },
+      },
+    });
+  }
+
+  /**
+   * Retrieve a specific version by its version ID.
+   */
+  async findVersionById(versionId: string) {
+    return prisma.fileVersion.findUnique({
+      where: { id: versionId },
+      include: {
+        chunks: {
+          include: { chunk: true },
+          orderBy: { chunkIndex: 'asc' },
+        },
+      },
+    });
+  }
 }
 
 export const fileRepository = new FileRepository();
