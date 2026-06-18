@@ -1,116 +1,147 @@
 # VaultDrive — Production-Grade Cloud Storage Backend
 
-VaultDrive is a portfolio-grade cloud storage backend engineered with Node.js, TypeScript, and Express. The project is focused on backend storage concepts rather than user interfaces, demonstrating advanced engineering practices around resumable chunked uploads, metadata caching, public secure sharing, content-addressable deduplication, and zero-copy versioning.
+A cloud storage backend built with **Node.js**, **TypeScript**, and **Express**, focused on backend infrastructure rather than UI. VaultDrive demonstrates production-level engineering around resumable uploads, content-addressable deduplication, zero-copy versioning, metadata caching, and secure public sharing.
 
 ---
 
 ## Key Engineering Features
 
-### 1. Layered Architecture & Separation of Concerns
-VaultDrive implements a clean, layered architectural pattern:
-*   **Controllers**: HTTP request/response parsing and parameters validation.
-*   **Services**: Core business logic execution and operation orchestration.
-*   **Repositories**: Data access layer wrapping all database queries, decoupling the core application logic from database schemas and the ORM (Prisma).
+### 1. Layered Architecture
+
+VaultDrive follows a clean separation of concerns across three layers:
+
+- **Controllers** — Parse HTTP requests, validate parameters, and shape responses.
+- **Services** — Execute core business logic and orchestrate cross-cutting operations.
+- **Repositories** — Encapsulate all database queries, decoupling application logic from Prisma and the underlying schema.
 
 ### 2. S3-Compatible Storage Abstraction
-We define a decoupled `StorageProvider` interface. Binary blobs are handled by a `FilebaseStorageProvider` implementing the AWS SDK v3 client configuration (`https://s3.filebase.io`) with `region: auto` and `forcePathStyle: true`. 
-Changing S3 providers (e.g. AWS S3, MinIO, Google Cloud Storage) requires only implementing the interface with zero changes to the service layer.
+
+A `StorageProvider` interface decouples binary storage from the rest of the application. The default implementation targets **Filebase** via the AWS SDK v3 (`https://s3.filebase.io`, `region: auto`, `forcePathStyle: true`).
+
+Swapping to AWS S3, MinIO, or GCS requires only a new interface implementation — zero changes to the service layer.
 
 ### 3. Content-Addressable Chunk Deduplication
-To optimize storage footprints, files are split into block segments and hashed using SHA-256:
-*   Every unique block is uploaded to Filebase under key `chunks/${chunkHash}`.
-*   Before uploading any chunk, VaultDrive queries the DB for the hash. If a duplicate exists, it skips the network upload and increments a `referenceCount` on the metadata record (cross-user deduplication).
-*   During file deletion, we decrement chunk reference counts and garbage collect (delete) binary assets from Filebase only when their `referenceCount` reaches zero.
+
+Files are split into fixed-size blocks and hashed with **SHA-256** to minimize storage footprint:
+
+- Each unique block is stored in Filebase under the key `chunks/${chunkHash}`.
+- Before uploading, VaultDrive checks the database for an existing hash. If a match is found, the upload is skipped and the existing chunk's `referenceCount` is incremented — enabling cross-user deduplication.
+- On file deletion, chunk reference counts are decremented. Chunks are garbage-collected from Filebase only when their `referenceCount` reaches zero.
 
 ### 4. Zero-Copy File Versioning
-When uploading files with identical filenames, VaultDrive appends a new version rather than creating duplicate file entities.
-*   **Restoring Versions**: Restoring a file to a previous version is a **zero-copy operation**. We create a new `FileVersion` record referencing the exact same chunks (and indices) as the target older version, instantly shifting the current pointer with zero bandwidth or storage overhead.
 
-### 5. Resumable Chunked Upload Sessions
-VaultDrive provides a resumable chunk upload API for robust uploads of large files:
-*   Clients initiate a session via `POST /files/chunk/start` to declare total size and chunk targets.
-*   Chunks can be uploaded in parallel or out of order.
-*   Clients can resume aborted uploads by querying `/files/chunk/:sessionId/status`, which returns completed chunk indexes from Redis and DB.
-*   **Sequential Assembly Hashing**: During completion, chunk streams are downloaded sequentially from object storage and piped to a SHA-256 builder. This computes the overall file integrity hash without loading large assets into the server's RAM.
+Uploading a file with an identical filename appends a new version rather than creating a duplicate entity.
 
-### 6. Caching Layer (Cache-Aside & Background Sync)
-Integrated with Redis (Valkey) to minimize database query stress:
-*   **Metadata Caching**: Looks up `vaultdrive:file:${fileId}` first, populating on misses (5-min TTL) and evicting immediately on deletion.
-*   **Share Link Performance**:
-    *   **Unlimited links** are cached in Redis including file and chunk structures. Streaming downloads query Redis and run DB download count increments asynchronously in the background.
-    *   **Limited links** (`maxDownloads` enforced) run synchronous, atomic database increments on download to prevent concurrency limit bypasses.
+- **Restoring a version** is a zero-copy operation: a new `FileVersion` record is created that references the same chunks (and indices) as the target version — no data transfer or storage overhead.
+
+### 5. Resumable Chunked Uploads
+
+A session-based API supports robust, resumable uploads for large files:
+
+1. The client initiates a session via `POST /files/chunk/start`, declaring the total size and chunk count.
+2. Chunks can be uploaded **in parallel** and **out of order**.
+3. Aborted uploads are resumed by querying `/files/chunk/:sessionId/status`, which returns completed chunk indices from Redis and the database.
+4. On completion, chunk streams are downloaded **sequentially** from object storage and piped through a SHA-256 builder to compute the file's integrity hash without buffering large payloads in memory.
+
+### 6. Caching Layer (Cache-Aside with Background Sync)
+
+Redis (Valkey) reduces database load through targeted caching:
+
+- **Metadata caching** — File metadata is looked up at `vaultdrive:file:${fileId}` first, populated on cache miss (5-minute TTL), and evicted immediately on deletion.
+- **Unlimited share links** — Cached in Redis with their full file and chunk structures. Downloads are streamed from cache while download-count increments run asynchronously in the background.
+- **Limited share links** (`maxDownloads` enforced) — Use synchronous, atomic database increments on each download to prevent concurrency-based limit bypasses.
 
 ---
 
-## Architectural Layout
+## Architecture
 
 ```mermaid
 graph TD
-    Client[Web/API Client]
+    Client[Web / API Client]
     Express[Express.js App]
-    Redis[Redis/Valkey Cache]
-    DB[(PostgreSQL Database)]
+    Redis[Redis / Valkey Cache]
+    DB[(PostgreSQL)]
     Filebase[Filebase S3 Storage]
 
     Client -->|API Requests| Express
-    Express <-->|Cache Check/Invalidate| Redis
-    Express <-->|Transaction Queries| DB
-    Express <-->|Download/Upload Streams| Filebase
+    Express <-->|Cache Check / Invalidate| Redis
+    Express <-->|Transactional Queries| DB
+    Express <-->|Stream Upload / Download| Filebase
 ```
 
 ---
 
-## API Endpoints Reference
+## API Reference
 
 ### Authentication
-*   `POST /api/v1/auth/register`: Register user credentials. Returns JWT.
-*   `POST /api/v1/auth/login`: Login user. Returns JWT.
-*   `GET /api/v1/auth/me`: Retrieve profile of authenticated user.
 
-### File Metadata & Standard Downloads (Authenticated)
-*   `POST /api/v1/files/upload`: Single multipart file upload (automatically checks for versioning/dedup).
-*   `GET /api/v1/files`: List user's files with offset pagination.
-*   `GET /api/v1/files/:id`: Get metadata of a single file (cache-aside).
-*   `GET /api/v1/files/:id/download`: Stream file binaries sequentially chunk-by-chunk.
-*   `DELETE /api/v1/files/:id`: Safely delete file version metadata and clean up orphaned chunks.
+| Method | Endpoint                  | Description                          |
+|--------|---------------------------|--------------------------------------|
+| POST   | `/api/v1/auth/register`   | Register a new user. Returns a JWT.  |
+| POST   | `/api/v1/auth/login`      | Authenticate a user. Returns a JWT.  |
+| GET    | `/api/v1/auth/me`         | Retrieve the authenticated user's profile. |
 
-### Public File Sharing (Unauthenticated Downloads)
-*   `POST /api/v1/files/:id/share`: Generate a secure share link token (supports `expiresAt` and `maxDownloads`).
-*   `GET /api/v1/share/:token`: Public endpoint to download shared files chunk-by-chunk.
+### Files (Authenticated)
 
-### File Version Control (Authenticated)
-*   `GET /api/v1/files/:id/versions`: Fetch full version history list.
-*   `POST /api/v1/files/:id/restore/:versionId`: Perform zero-copy version restore.
+| Method | Endpoint                        | Description                                             |
+|--------|---------------------------------|---------------------------------------------------------|
+| POST   | `/api/v1/files/upload`          | Upload a file (multipart). Handles versioning and dedup automatically. |
+| GET    | `/api/v1/files`                 | List the user's files with offset-based pagination.     |
+| GET    | `/api/v1/files/:id`             | Get file metadata (served from cache when available).   |
+| GET    | `/api/v1/files/:id/download`    | Stream the file by sequentially assembling its chunks.  |
+| DELETE | `/api/v1/files/:id`             | Delete a file version and garbage-collect orphaned chunks. |
 
-### Resumable Chunk Uploads (Authenticated)
-*   `POST /api/v1/files/chunk/start`: Initiate a resumable upload session.
-*   `POST /api/v1/files/chunk/:sessionId/upload`: Upload individual chunk binary (multipart or octet-stream).
-*   `GET /api/v1/files/chunk/:sessionId/status`: Get list of completed chunk indexes.
-*   `POST /api/v1/files/chunk/:sessionId/complete`: finalize uploads, calculate hashes, and commit file.
+### Public Sharing (Unauthenticated)
+
+| Method | Endpoint                        | Description                                             |
+|--------|---------------------------------|---------------------------------------------------------|
+| POST   | `/api/v1/files/:id/share`       | Generate a share link with optional `expiresAt` and `maxDownloads`. |
+| GET    | `/api/v1/share/:token`          | Download a shared file via its token.                   |
+
+### Version Control (Authenticated)
+
+| Method | Endpoint                                  | Description                            |
+|--------|-------------------------------------------|----------------------------------------|
+| GET    | `/api/v1/files/:id/versions`              | List the full version history.         |
+| POST   | `/api/v1/files/:id/restore/:versionId`    | Restore to a previous version (zero-copy). |
+
+### Resumable Uploads (Authenticated)
+
+| Method | Endpoint                                    | Description                                    |
+|--------|---------------------------------------------|------------------------------------------------|
+| POST   | `/api/v1/files/chunk/start`                 | Initiate a resumable upload session.           |
+| POST   | `/api/v1/files/chunk/:sessionId/upload`     | Upload an individual chunk (multipart or octet-stream). |
+| GET    | `/api/v1/files/chunk/:sessionId/status`     | Check which chunk indices have been uploaded.  |
+| POST   | `/api/v1/files/chunk/:sessionId/complete`   | Finalize the session: hash, validate, and commit the file. |
 
 ---
 
-## Database Entity Relations (Prisma)
+## Data Model (Prisma)
 
-*   `User`: Owns `File` and `UploadSession` records.
-*   `File`: Tracks `filename`, `mimeType`, `totalSize`, and is linked to multiple `FileVersion` records.
-*   `FileVersion`: Represents a snapshot of the file at a point in time, linking to multiple ordered `FileChunk` join records.
-*   `Chunk`: Core deduplicated block representation. Unique by `sha256Hash` and `storageKey`, containing a `referenceCount`.
-*   `FileChunk`: Connects `FileVersion` and `Chunk` with a `chunkIndex` preserving chunk assembly order.
-*   `UploadSession`: Tracks state, expiry, and progress mapping for chunked uploads.
-*   `ShareLink`: Tracks tokens, download caps, and access logs.
+| Entity            | Role                                                                                      |
+|-------------------|-------------------------------------------------------------------------------------------|
+| **User**          | Owns `File` and `UploadSession` records.                                                  |
+| **File**          | Stores `filename`, `mimeType`, and `totalSize`. Links to multiple `FileVersion` records.  |
+| **FileVersion**   | A point-in-time snapshot of a file, linked to ordered `FileChunk` join records.           |
+| **Chunk**         | A deduplicated block, unique by `sha256Hash` and `storageKey`, with a `referenceCount`.   |
+| **FileChunk**     | Joins `FileVersion` to `Chunk` with a `chunkIndex` to preserve assembly order.            |
+| **UploadSession** | Tracks session state, expiry, and chunk-level progress for resumable uploads.             |
+| **ShareLink**     | Stores tokens, download caps, expiry, and access logs.                                    |
 
 ---
 
-## Local Setup & Configuration
+## Local Setup
 
 ### Prerequisites
-*   Node.js (v18+)
-*   pnpm (v8+)
-*   PostgreSQL & Redis
 
-### 1. Environment Configurations
-Create a `.env` file in the root folder using `.env.example` as a baseline:
+- Node.js v18+
+- pnpm v8+
+- PostgreSQL & Redis
+
+### 1. Configure Environment
+
+Create a `.env` file from the example template:
+
 ```env
 PORT=3000
 DATABASE_URL="postgresql://username:password@localhost:5432/vaultdrive?schema=public"
@@ -122,19 +153,21 @@ FILEBASE_ACCESS_KEY="your-filebase-access-key"
 FILEBASE_SECRET_KEY="your-filebase-secret-key"
 FILEBASE_BUCKET="chunkvault"
 
-CHUNK_SIZE_BYTES=5242880  # 5 MB Default
+CHUNK_SIZE_BYTES=5242880  # 5 MB default
 ```
 
-### 2. Installations & Database Sync
+### 2. Install Dependencies & Sync Database
+
 ```bash
 pnpm install
 pnpm prisma:generate
 npx prisma db push
 ```
 
-### 3. Running App
+### 3. Run
+
 ```bash
-pnpm dev
-pnpm build
-pnpm start
+pnpm dev      # Development server
+pnpm build    # Production build
+pnpm start    # Start production server
 ```
